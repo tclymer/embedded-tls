@@ -22,7 +22,9 @@ use core::marker::PhantomData;
 use core::time::Duration;
 #[cfg(feature = "defmt")]
 use defmt::Debug2Format;
-use pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
+use pki_types::{ServerName, SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime};
+
+pub use pki_types::{CertificateDer, TrustAnchor};
 
 mod algorithms;
 
@@ -31,22 +33,33 @@ mod algorithms;
 /// Signatures are checked through embassy-crypto, for the algorithms that the `p256`,
 /// `p384` and `ed25519` features enable, and through the `rsa` crate with the `rsa` feature.
 /// The server's first certificate is its own, and the rest are intermediates in any order.
-/// rustls-webpki builds a path through at most six intermediates.
+/// rustls-webpki builds a path through at most six intermediates to one trusted root:
+/// the certificate given to [`new`](Self::new), or any of the anchors given to
+/// [`with_trust_anchors`](Self::with_trust_anchors).
 ///
-/// The verifier keeps a copy of the server's own certificate until it checks the
-/// `CertificateVerify` signature, so `CERT_SIZE` must hold that certificate. The intermediates
-/// are not copied. A larger certificate fails with [`TlsError::OutOfMemory`] after the chain
-/// has been verified. The README shows how to measure the server's certificate.
+/// The verifier keeps a copy of the server certificate's public key (its
+/// `SubjectPublicKeyInfo`) until it checks the `CertificateVerify` signature, so `CERT_SIZE`
+/// must hold that key: 91 bytes for P-256, 120 for P-384, 294 for RSA-2048 and 550 for
+/// RSA-4096. The certificates are not copied. A larger key fails with
+/// [`TlsError::OutOfMemory`] after the chain has been verified.
 pub struct CertVerifier<'a, CipherSuite, Clock, const CERT_SIZE: usize>
 where
     Clock: TlsClock,
     CipherSuite: TlsCipherSuite,
 {
-    ca: Certificate<&'a [u8]>,
+    roots: Roots<'a>,
     host: Option<heapless::String<64>>,
     certificate_transcript: Option<CipherSuite::Hash>,
-    certificate: Option<heapless::Vec<u8, CERT_SIZE>>,
+    public_key: Option<heapless::Vec<u8, CERT_SIZE>>,
     _clock: PhantomData<Clock>,
+}
+
+/// The roots a chain may end at.
+enum Roots<'a> {
+    /// One root certificate, read as a trust anchor for each chain.
+    Certificate(Certificate<&'a [u8]>),
+    /// Any of these anchors.
+    Anchors(&'a [TrustAnchor<'a>]),
 }
 
 impl<'a, CipherSuite, Clock, const CERT_SIZE: usize> CertVerifier<'a, CipherSuite, Clock, CERT_SIZE>
@@ -54,16 +67,39 @@ where
     Clock: TlsClock,
     CipherSuite: TlsCipherSuite,
 {
+    /// A verifier that trusts one root certificate, `ca`.
     #[must_use]
     pub fn new(ca: Certificate<&'a [u8]>) -> Self {
+        Self::with_roots(Roots::Certificate(ca))
+    }
+
+    /// A verifier that trusts any of `anchors`, as a set of public roots does.
+    ///
+    /// [`trust_anchor`] reads an anchor from a DER root certificate without copying it. An
+    /// empty set trusts nothing.
+    #[must_use]
+    pub fn with_trust_anchors(anchors: &'a [TrustAnchor<'a>]) -> Self {
+        Self::with_roots(Roots::Anchors(anchors))
+    }
+
+    fn with_roots(roots: Roots<'a>) -> Self {
         Self {
-            ca,
+            roots,
             host: None,
             certificate_transcript: None,
-            certificate: None,
+            public_key: None,
             _clock: PhantomData,
         }
     }
+}
+
+/// The trust anchor in `certificate`, a DER root certificate, borrowing its subject and key.
+///
+/// The certificate is taken as trusted: its signature, its dates and its extensions other than
+/// name constraints are not checked, as for any root. `CertificateDer::from_slice` is `const`, so
+/// a set of built-in roots can be a `static`.
+pub fn trust_anchor<'a>(certificate: &'a CertificateDer<'a>) -> Result<TrustAnchor<'a>, TlsError> {
+    webpki::anchor_from_trusted_cert(certificate).map_err(|e| refused(&e, TlsError::DecodeError))
 }
 
 impl<CipherSuite, Clock, const CERT_SIZE: usize> TlsVerifier<CipherSuite>
@@ -93,14 +129,24 @@ where
         let now = if let Some(now) = Clock::now() {
             now
         } else {
-            warn!("No time provided, so the certificate dates are not checked");
-            latest_not_before(&cert)?
+            warn!("No time provided, so the certificate dates are checked at the clock's floor");
+            latest_not_before(&cert)?.max(Clock::floor())
         };
-        verify_certificate(host, &self.ca, &cert, now)?;
+        match &self.roots {
+            Roots::Certificate(Certificate::X509(ca)) => {
+                let ca = CertificateDer::from(*ca);
+                let anchor = trust_anchor(&ca)?;
+                verify_certificate(host, core::slice::from_ref(&anchor), &cert, now)?;
+            }
+            Roots::Certificate(_) => return Err(TlsError::DecodeError),
+            Roots::Anchors(anchors) => verify_certificate(host, anchors, &cert, now)?,
+        }
+        let leaf = end_entity(&cert)?;
+        let key = subject_public_key_info(&leaf).map_err(|_| TlsError::DecodeError)?;
         // Copied in place, so no second copy of `CERT_SIZE` bytes sits on the stack.
-        let certificate = self.certificate.insert(heapless::Vec::new());
-        certificate
-            .extend_from_slice(&end_entity(&cert)?)
+        let public_key = self.public_key.insert(heapless::Vec::new());
+        public_key
+            .extend_from_slice(key)
             .map_err(|_| TlsError::OutOfMemory)?;
         self.certificate_transcript.replace(transcript.clone());
         Ok(())
@@ -113,8 +159,8 @@ where
             handshake_hash.finalize().as_ref(),
         )?;
 
-        let certificate = CertificateDer::from(&unwrap!(self.certificate.as_ref())[..]);
-        verify_signature(&msg[..], &certificate, &verify)
+        let public_key = SubjectPublicKeyInfoDer::from(&unwrap!(self.public_key.as_ref())[..]);
+        verify_signature(&msg[..], &public_key, &verify)
     }
 }
 
@@ -166,23 +212,26 @@ fn latest_not_before(certificate: &ServerCertificate) -> Result<u64, TlsError> {
     latest.ok_or(TlsError::DecodeError)
 }
 
-/// The `notBefore` of a DER certificate, in seconds since the Unix epoch.
+/// Reads the `tbsCertificate` of a DER certificate with `read`, which starts at `serialNumber`
+/// (RFC 5280, section 4.1) and need not read to the end.
 ///
-/// rustls-webpki keeps a certificate's validity private, so this reads it: the certificate's
-/// `SEQUENCE`, then `tbsCertificate` up to `validity` (RFC 5280, section 4.1).
-fn not_before(certificate: &[u8]) -> der::Result<u64> {
-    use der::asn1::{GeneralizedTime, UtcTime};
-    use der::{Decode, Reader, SliceReader, Tag, TagNumber};
+/// rustls-webpki keeps a certificate's fields private, so the dates and the public key are read
+/// here.
+fn read_tbs<'a, T>(
+    certificate: &'a [u8],
+    read: impl FnOnce(&mut der::SliceReader<'a>) -> der::Result<T>,
+) -> der::Result<T> {
+    use der::{Reader, SliceReader, Tag, TagNumber};
 
-    let skip_rest = |reader: &mut SliceReader<'_>| -> der::Result<()> {
+    let skip_rest = |reader: &mut SliceReader<'a>| -> der::Result<()> {
         while !reader.is_finished() {
             reader.tlv_bytes()?;
         }
         Ok(())
     };
     let mut reader = SliceReader::new(certificate)?;
-    let not_before = reader.sequence(|certificate| -> der::Result<Duration> {
-        let not_before = certificate.sequence(|tbs| -> der::Result<Duration> {
+    reader.sequence(|certificate| -> der::Result<T> {
+        let value = certificate.sequence(|tbs| -> der::Result<T> {
             let version = Tag::ContextSpecific {
                 constructed: true,
                 number: TagNumber(0),
@@ -190,25 +239,49 @@ fn not_before(certificate: &[u8]) -> der::Result<u64> {
             if Tag::peek(tbs)? == version {
                 tbs.tlv_bytes()?;
             }
-            // serialNumber, signature and issuer
-            for _ in 0..3 {
-                tbs.tlv_bytes()?;
-            }
-            let not_before = tbs.sequence(|validity| -> der::Result<Duration> {
-                let not_before = match Tag::peek(validity)? {
-                    Tag::UtcTime => UtcTime::decode(validity)?.to_unix_duration(),
-                    _ => GeneralizedTime::decode(validity)?.to_unix_duration(),
-                };
-                skip_rest(validity)?;
-                Ok(not_before)
-            })?;
+            let value = read(tbs)?;
             skip_rest(tbs)?;
-            Ok(not_before)
+            Ok(value)
         })?;
         skip_rest(certificate)?;
-        Ok(not_before)
+        Ok(value)
+    })
+}
+
+/// The `notBefore` of a DER certificate, in seconds since the Unix epoch.
+fn not_before(certificate: &[u8]) -> der::Result<u64> {
+    use der::asn1::{GeneralizedTime, UtcTime};
+    use der::{Decode, Reader, Tag};
+
+    let not_before = read_tbs(certificate, |tbs| {
+        // serialNumber, signature and issuer
+        for _ in 0..3 {
+            tbs.tlv_bytes()?;
+        }
+        tbs.sequence(|validity| -> der::Result<Duration> {
+            let not_before = match Tag::peek(validity)? {
+                Tag::UtcTime => UtcTime::decode(validity)?.to_unix_duration(),
+                _ => GeneralizedTime::decode(validity)?.to_unix_duration(),
+            };
+            // notAfter
+            validity.tlv_bytes()?;
+            Ok(not_before)
+        })
     })?;
     Ok(not_before.as_secs())
+}
+
+/// The `subjectPublicKeyInfo` of a DER certificate, with its tag and length.
+fn subject_public_key_info(certificate: &[u8]) -> der::Result<&[u8]> {
+    use der::Reader;
+
+    read_tbs(certificate, |tbs| {
+        // serialNumber, signature, issuer, validity and subject
+        for _ in 0..5 {
+            tbs.tlv_bytes()?;
+        }
+        tbs.tlv_bytes()
+    })
 }
 
 /// The server's own certificate, which must be the first entry and X.509.
@@ -219,14 +292,15 @@ fn end_entity<'a>(certificate: &ServerCertificate<'a>) -> Result<CertificateDer<
     }
 }
 
+/// Checks the `CertificateVerify` signature with the server certificate's `public_key`.
 fn verify_signature(
     message: &[u8],
-    certificate: &CertificateDer<'_>,
+    public_key: &SubjectPublicKeyInfoDer<'_>,
     verify: &CertificateVerifyRef,
 ) -> Result<(), TlsError> {
-    let cert = webpki::EndEntityCert::try_from(certificate)
+    let key = webpki::RawPublicKeyEntity::try_from(public_key)
         .map_err(|e| refused(&e, TlsError::DecodeError))?;
-    cert.verify_signature(
+    key.verify_signature(
         algorithm(verify.signature_scheme)?,
         message,
         verify.signature,
@@ -236,17 +310,10 @@ fn verify_signature(
 
 fn verify_certificate(
     host: &str,
-    ca: &Certificate<&[u8]>,
+    anchors: &[TrustAnchor<'_>],
     certificate: &ServerCertificate,
     now: u64,
 ) -> Result<(), TlsError> {
-    let Certificate::X509(ca) = ca else {
-        return Err(TlsError::DecodeError);
-    };
-    let ca = CertificateDer::from(*ca);
-    let anchor =
-        webpki::anchor_from_trusted_cert(&ca).map_err(|e| refused(&e, TlsError::DecodeError))?;
-
     let leaf = end_entity(certificate)?;
     let mut intermediates = heapless::Vec::<CertificateDer<'_>, MAX_CERTIFICATE_ENTRIES>::new();
     for entry in certificate.entries.iter().skip(1) {
@@ -262,7 +329,7 @@ fn verify_certificate(
         webpki::EndEntityCert::try_from(&leaf).map_err(|e| refused(&e, TlsError::DecodeError))?;
     cert.verify_for_usage(
         algorithms::ALL,
-        core::slice::from_ref(&anchor),
+        anchors,
         &intermediates,
         UnixTime::since_unix_epoch(Duration::from_secs(now)),
         webpki::KeyUsage::server_auth(),
@@ -557,12 +624,12 @@ mod cert_verifier_tests {
             assert_matches!(verify(&der!("ca-cert"), &chain, "localhost"), Ok(()));
         }
 
-        /// A verifier whose `CERT_SIZE` holds `im-server-cert.pem`, 442 bytes, but not the chain
-        /// with `im-cert.pem`, 486 bytes.
-        type SmallVerifier<'a> = CertVerifier<'a, Aes128GcmSha256, SystemTime, 512>;
+        /// A verifier whose `CERT_SIZE` holds the 91-byte P-256 key of `im-server-cert.pem`, but
+        /// not that certificate, 442 bytes.
+        type SmallVerifier<'a> = CertVerifier<'a, Aes128GcmSha256, SystemTime, 128>;
 
         #[test]
-        fn cert_size_needs_to_hold_only_the_server_certificate() {
+        fn cert_size_needs_to_hold_only_the_server_public_key() {
             let message = message(&[&der!("im-server-cert"), &der!("im-cert")]);
             let ca = der!("ca-cert");
             let mut verifier = SmallVerifier::new(Certificate::X509(&ca));
@@ -739,6 +806,143 @@ mod cert_verifier_tests {
                 Err(TlsError::InvalidCertificate)
             );
         }
+
+        /// A clock without the time, built on 2022-01-01.
+        struct FloorIn2022;
+
+        impl TlsClock for FloorIn2022 {
+            fn now() -> Option<u64> {
+                None
+            }
+            fn floor() -> u64 {
+                1_640_995_200
+            }
+        }
+
+        /// A clock without the time, built on 2019-01-01.
+        struct FloorIn2019;
+
+        impl TlsClock for FloorIn2019 {
+            fn now() -> Option<u64> {
+                None
+            }
+            fn floor() -> u64 {
+                1_546_300_800
+            }
+        }
+
+        // expired-server-cert.pem is valid in 2020 only.
+        #[test]
+        fn server_cert_that_expired_before_the_floor_is_rejected_without_the_time() {
+            let chain = [&der!("expired-server-cert")[..]];
+            assert_matches!(
+                verify_with_clock::<FloorIn2022>(&der!("ca-cert"), &chain),
+                Err(TlsError::InvalidCertificate)
+            );
+        }
+
+        #[test]
+        fn server_cert_issued_after_the_floor_is_accepted_without_the_time() {
+            let chain = [&der!("expired-server-cert")[..]];
+            assert_matches!(
+                verify_with_clock::<FloorIn2019>(&der!("ca-cert"), &chain),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn server_cert_valid_at_the_floor_is_accepted_without_the_time() {
+            let chain = [&der!("server-cert")[..]];
+            assert_matches!(
+                verify_with_clock::<FloorIn2022>(&der!("ca-cert"), &chain),
+                Ok(())
+            );
+        }
+
+        /// Runs `chain` through a verifier for localhost that trusts any of `roots`.
+        fn verify_with_anchors(roots: &[&[u8]], chain: &[&[u8]]) -> Result<(), TlsError> {
+            let roots: std::vec::Vec<_> = roots.iter().map(|r| CertificateDer::from(*r)).collect();
+            let anchors: std::vec::Vec<_> =
+                roots.iter().map(|r| trust_anchor(r).unwrap()).collect();
+            let message = message(chain);
+            let mut verifier = Verifier::with_trust_anchors(&anchors);
+            verifier.set_hostname_verification("localhost")?;
+            verifier.verify_certificate(&embassy_crypto::Sha256::new(), parse(&message))
+        }
+
+        #[test]
+        fn chain_to_any_of_several_anchors_is_accepted() {
+            let chain = [&der!("im-server-cert")[..], &der!("im-cert")];
+            let (other, p384, ca) = (
+                der!("other-root-cert"),
+                der!("p384-ca-cert"),
+                der!("ca-cert"),
+            );
+            assert_matches!(verify_with_anchors(&[&other, &p384, &ca], &chain), Ok(()));
+            assert_matches!(verify_with_anchors(&[&ca, &other], &chain), Ok(()));
+        }
+
+        #[test]
+        fn chain_to_none_of_the_anchors_is_rejected() {
+            let chain = [&der!("im-server-cert")[..], &der!("im-cert")];
+            let (other, p384) = (der!("other-root-cert"), der!("p384-ca-cert"));
+            assert_matches!(
+                verify_with_anchors(&[&other, &p384], &chain),
+                Err(TlsError::InvalidCertificate)
+            );
+        }
+
+        #[test]
+        fn no_anchors_trust_nothing() {
+            assert_matches!(
+                verify_with_anchors(&[], &[&der!("server-cert")]),
+                Err(TlsError::InvalidCertificate)
+            );
+        }
+
+        #[test]
+        fn certificate_verify_is_checked_with_a_chain_to_one_of_several_anchors() {
+            let (other, ca) = (der!("other-root-cert"), der!("ca-cert"));
+            let roots = [
+                CertificateDer::from(&other[..]),
+                CertificateDer::from(&ca[..]),
+            ];
+            let anchors = [
+                trust_anchor(&roots[0]).unwrap(),
+                trust_anchor(&roots[1]).unwrap(),
+            ];
+            let message = message(&[&der!("server-cert")]);
+            let mut verifier = Verifier::with_trust_anchors(&anchors);
+            verifier.set_hostname_verification("localhost").unwrap();
+            verifier
+                .verify_certificate(&embassy_crypto::Sha256::new(), parse(&message))
+                .unwrap();
+            let key = key(include_str!("../tests/data/server-key.pem"));
+            let signature = sign(&key, MessageDigest::sha256());
+            assert_matches!(
+                verifier.verify_signature(CertificateVerifyRef {
+                    signature_scheme: SignatureScheme::EcdsaSecp256r1Sha256,
+                    signature: &signature,
+                }),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn a_trust_anchor_is_not_read_from_bytes_that_are_not_a_certificate() {
+        let not_a_certificate = CertificateDer::from(&[0x30, 0x03, 0x02, 0x01, 0x01][..]);
+        assert_matches!(trust_anchor(&not_a_certificate), Err(TlsError::DecodeError));
+    }
+
+    #[test]
+    fn subject_public_key_info_reads_the_key_with_its_tag() {
+        // A P-256 key: SEQUENCE { algorithm, BIT STRING of 66 bytes }, 91 bytes in all.
+        let certificate = der!("server-cert");
+        let key = subject_public_key_info(&certificate).unwrap();
+        assert_eq!((key.len(), key[0]), (91, 0x30));
+        let key = SubjectPublicKeyInfoDer::from(key);
+        assert!(webpki::RawPublicKeyEntity::try_from(&key).is_ok());
     }
 
     #[cfg(feature = "p384")]
@@ -855,11 +1059,11 @@ mod cert_verifier_tests {
             key(include_str!("../tests/data/rsa-server-key.pem"))
         }
 
-        /// A verifier whose `CERT_SIZE` is smaller than `rsa-server-cert.pem`.
-        type SmallVerifier<'a> = CertVerifier<'a, Aes128GcmSha256, SystemTime, 512>;
+        /// A verifier whose `CERT_SIZE` is smaller than an RSA-2048 key, 294 bytes.
+        type SmallVerifier<'a> = CertVerifier<'a, Aes128GcmSha256, SystemTime, 256>;
 
         #[test]
-        fn a_server_certificate_larger_than_cert_size_is_refused() {
+        fn a_server_key_larger_than_cert_size_is_refused() {
             let message = message(&[&der!("rsa-server-cert")]);
             let ca = der!("rsa-ca-cert");
             let mut verifier = SmallVerifier::new(Certificate::X509(&ca));
@@ -867,6 +1071,28 @@ mod cert_verifier_tests {
             assert_matches!(
                 verifier.verify_certificate(&embassy_crypto::Sha256::new(), parse(&message)),
                 Err(TlsError::OutOfMemory)
+            );
+        }
+
+        // many-names-rsa-server-cert.pem is 5.5 KB, for rsa-server-key.pem.
+        #[test]
+        fn a_large_server_certificate_verifies_when_cert_size_holds_its_key() {
+            let message = message(&[&der!("many-names-rsa-server-cert")]);
+            let ca = der!("rsa-ca-cert");
+            let mut verifier =
+                CertVerifier::<Aes128GcmSha256, SystemTime, 512>::new(Certificate::X509(&ca));
+            verifier.set_hostname_verification("localhost").unwrap();
+            assert_matches!(
+                verifier.verify_certificate(&embassy_crypto::Sha256::new(), parse(&message)),
+                Ok(())
+            );
+            let signature = sign_rsa_pss(&rsa_key(), MessageDigest::sha256());
+            assert_matches!(
+                verifier.verify_signature(CertificateVerifyRef {
+                    signature_scheme: SignatureScheme::RsaPssRsaeSha256,
+                    signature: &signature,
+                }),
+                Ok(())
             );
         }
 

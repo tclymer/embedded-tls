@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- `webpki::CertVerifier::with_trust_anchors` trusts any of a set of roots, such as a device's built-in set of public roots. `webpki::trust_anchor` reads an anchor from a DER root certificate without copying it.
+- The `webpki` verifier keeps only the server certificate's public key after verifying the chain, so `CERT_SIZE` needs to hold that key (294 bytes for RSA-2048), not the certificate. A server certificate with many names no longer fails with `TlsError::OutOfMemory`.
+- Added `TlsClock::floor()`, the earliest the time can be, such as the firmware's build time. While `now()` returns `None`, the `webpki` verifier checks the dates at the later of the floor and the latest `notBefore` in the chain, so a certificate that expired before the floor is refused. The default floor is 0, as before.
 - Fix the client accepting a server `Finished` without server authentication (#215). The client now requires a verified `Certificate` and `CertificateVerify`, in that order, or a pre-shared key it offered.
 - A `write` or `flush` that is cancelled or fails part way through a TLS record is completed by the next `write` or `flush`.
 - A blocking `read` that fails part way through a record is completed by the next `read`.

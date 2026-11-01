@@ -144,6 +144,18 @@ pub trait TlsClock {
     /// dates. A clock that returns `None` until it syncs accepts certificates whatever their dates
     /// until then. A device that must check dates waits for the time before it connects.
     fn now() -> Option<u64>;
+
+    /// The earliest the time can be, in seconds since the Unix epoch, such as when the firmware
+    /// was built. 0, the default, means no floor.
+    ///
+    /// While [`now`](Self::now) returns `None`, the `webpki` verifier checks the dates at the later
+    /// of this floor and the latest `notBefore` in the chain. A certificate that expired before the
+    /// floor is then refused even without the time. A certificate that is not yet valid cannot be
+    /// told apart without it.
+    #[must_use]
+    fn floor() -> u64 {
+        0
+    }
 }
 
 #[deprecated(note = "renamed to InsecureIgnoreDates")]

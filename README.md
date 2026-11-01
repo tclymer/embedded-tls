@@ -36,11 +36,25 @@ tls.open(TlsContext::new(&config, verifier)).await?;
 
 `with_server_name` sets the name the certificate must match, a DNS name or an IP address. Without one, `webpki::CertVerifier` refuses the certificate with `TlsError::MissingServerName`. For an IP address, the client sends no SNI, as RFC 6066 requires. `pki::CertVerifier` matches DNS names only.
 
-`CERT_SIZE`, the verifier's last parameter, must hold the server's own certificate. A larger one fails with `TlsError::OutOfMemory`. Measure it with `openssl s_client -connect example.com:443 </dev/null | openssl x509 -outform DER | wc -c`, and leave room for a renewed certificate.
+To trust any of several roots, such as a set of public roots for servers whose CA may change, read each with `webpki::trust_anchor` and pass them to `CertVerifier::with_trust_anchors`. `CertificateDer::from_slice` is `const`, so the roots can be a `static`.
+
+```rust,ignore
+use embedded_tls::webpki::{CertVerifier, CertificateDer, trust_anchor};
+
+static ROOTS: [CertificateDer<'static>; 2] = [
+    CertificateDer::from_slice(include_bytes!("roots/isrg-root-x1.der")),
+    CertificateDer::from_slice(include_bytes!("roots/gts-root-r4.der")),
+];
+let anchors = ROOTS.each_ref().map(|root| trust_anchor(root).unwrap());
+let verifier: CertVerifier<Aes128GcmSha256, SystemTime, 600> =
+    CertVerifier::with_trust_anchors(&anchors);
+```
+
+`CERT_SIZE`, the verifier's last parameter, must hold the server certificate's public key, its `SubjectPublicKeyInfo`: 91 bytes for P-256, 120 for P-384, 294 for RSA-2048 and 550 for RSA-4096. A larger key fails with `TlsError::OutOfMemory`. The certificates themselves are not copied, whatever their size.
 
 Each signature feature needs an `embassy-crypto` driver linked for its algorithm, such as `embassy-crypto-rustcrypto` with its `embassy-crypto-p256-ecdsa` feature for `p256`. Without one, the link fails with an undefined symbol. The `rsa` feature uses the `rsa` crate, which needs a global allocator.
 
-The verifier's `TlsClock` gives the time for the certificate dates. `std::time::SystemTime` implements it with the `std` feature. On a device, implement it for a type that reads the device's clock. On a device that does not know the time, use `InsecureIgnoreDates`. The verifier then skips the dates, and every other check still runs.
+The verifier's `TlsClock` gives the time for the certificate dates. `std::time::SystemTime` implements it with the `std` feature. On a device, implement it for a type that reads the device's clock. On a device that does not know the time, use `InsecureIgnoreDates`. The verifier then skips the dates, and every other check still runs. A clock that returns `None` until it syncs can give a `floor()`, such as its firmware's build time: until then, the `webpki` verifier refuses a certificate that expired before the floor.
 
 To move from `pki::CertVerifier`, change the import and the feature. The generics and the constructor are the same, and `CERT_SIZE` can shrink to the server's certificate. To move from the old `webpki` verifier, drop the `alloc` feature, enable a signature feature if `default-features` is off, and enable `rsa` for RSA chains.
 

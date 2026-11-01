@@ -81,6 +81,10 @@ openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa-server-cert.
 openssl req -newkey rsa:1024 -keyout rsa1024-server-key.pem -nodes -out rsa1024-server-cert.csr -sha256 -subj "/CN=localhost"
 openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa1024-server-cert.csr -out rsa1024-server-cert.pem -days 10000 -CAcreateserial -extfile <(printf 'subjectAltName = DNS:localhost\n')
 
+# Create a certificate for rsa-server-key.pem that names 129 hosts: 5.5 KB, as large as some public
+# servers' certificates
+openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa-server-cert.csr -out many-names-rsa-server-cert.pem -days 10000 -CAcreateserial -extfile <(printf 'subjectAltName = DNS:localhost'; for i in $(seq 1 128); do printf ', DNS:service-%03d.region-name.example.com' "$i"; done; printf '\n')
+
 # Create RSA private key, certificate signing request (CSR) and certificate for client
 openssl req -newkey rsa:2048 -keyout rsa-client-key.pem -nodes -out rsa-client-cert.csr -sha256
 openssl x509 -req -CA rsa-ca-cert.pem -CAkey rsa-ca-key.pem -in rsa-client-cert.csr -out rsa-client-cert.pem -days 10000 -CAcreateserial
